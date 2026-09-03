@@ -1237,48 +1237,54 @@ fastify.get('/api/channels/:id/status', async (request, reply) => {
       statusDetails.isWebhookOnline = isWebhookOnline;
     }
     
-    // Check Channel Engine status via OSC API first
+    // Enrich the reported status string via the OSC API. This is treated as
+    // enrichment only: the OSC instance object does not carry a health field,
+    // so it must not be the sole source of truth for isOnAir (see #13).
+    let oscStatusString = null;
     if (oscClient.isConfigured()) {
       try {
         const oscStatus = await oscClient.getChannelEngineStatus(channel.channelEngineInstance);
         if (!oscStatus.error) {
-          isOnAir = oscStatus.isRunning || false;
-          status = oscStatus.status || 'unknown';
+          if (oscStatus.status) {
+            oscStatusString = oscStatus.status;
+          }
           statusDetails = { oscStatus: oscStatus.details };
         }
       } catch (oscError) {
         console.error('Failed to get OSC status:', oscError);
       }
     }
-    
-    // Fallback: Check if Channel Engine stream is accessible
-    if (channel.channelEngineUrl && (!oscClient.isConfigured() || status === 'unknown')) {
+
+    // Primary signal: is the Channel Engine stream reachable? A reachable
+    // manifest means the channel is on air, regardless of whether OSC is
+    // configured — the OSC call above only enriches the status string.
+    if (channel.channelEngineUrl) {
       try {
         const response = await fetch(channel.channelEngineUrl, { method: 'HEAD' });
         const streamAccessible = response.ok;
-        
-        if (!oscClient.isConfigured()) {
-          isOnAir = streamAccessible;
-          status = streamAccessible ? 'on_air' : 'offline';
-        }
-        
+
+        isOnAir = streamAccessible;
+        status = streamAccessible ? 'on_air' : 'offline';
         statusDetails.streamAccessible = streamAccessible;
       } catch (error) {
         statusDetails.streamError = error.message;
-        if (!oscClient.isConfigured()) {
-          status = 'error';
-        }
+        isOnAir = false;
+        status = 'error';
       }
     }
-    
-    // Use webhook status as fallback or if no other method worked
-    if (isWebhookOnline && (status === 'offline' || status === 'unknown')) {
+
+    // Additional positive signal: a recent webhook call confirms the channel is
+    // live even if the stream check above did not mark it on air. Never used to
+    // force isOnAir false — only to rescue it to true.
+    if (isWebhookOnline && !isOnAir) {
       status = 'online_webhook';
       isOnAir = true;
-    } else if (status === 'offline' && isWebhookOnline) {
-      // Prefer webhook status for "online" indication
-      status = 'online_webhook';
-      isOnAir = true;
+    }
+
+    // If OSC provided a meaningful status string, surface it (unless a positive
+    // webhook rescue already set a more specific one).
+    if (oscStatusString && status !== 'online_webhook') {
+      statusDetails.oscStatusString = oscStatusString;
     }
     
     // Update status in database
