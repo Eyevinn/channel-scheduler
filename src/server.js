@@ -82,6 +82,17 @@ async function setupMinioForScheduler(instanceName = 'schedulerstorage', usernam
       true // Make output bucket public
     );
 
+    // Don't let a failed bucket be swallowed: createMinioBuckets records
+    // per-bucket failures in its results instead of throwing, so a startup that
+    // could not create its storage would otherwise look healthy. Surface it.
+    const failedBuckets = (bucketResults || []).filter((r) => !r.success);
+    if (failedBuckets.length > 0) {
+      const detail = failedBuckets
+        .map((r) => `${r.bucket}: ${r.error}`)
+        .join('; ');
+      throw new Error(`MinIO bucket setup failed for: ${detail}`);
+    }
+
     console.log('MinIO setup completed:', {
       instance: minioConfig.instanceName,
       endpoint: minioConfig.endpoint,
@@ -1306,6 +1317,9 @@ fastify.get('/api/channels/:id/status', async (request, reply) => {
 
 // Global flag to track setup state
 let isSettingUpStorage = false;
+// Records the last storage-setup failure so it isn't silently swallowed — a
+// startup that couldn't create its buckets must not look healthy.
+let storageSetupError = null;
 
 // Setup page HTML
 const setupPageHtml = `<!DOCTYPE html>
@@ -1383,6 +1397,19 @@ fastify.get('/api/osc-status', async (request, reply) => {
   }
 });
 
+// Report storage-setup health so a failed startup is visible instead of silent.
+fastify.get('/api/storage/status', async (request, reply) => {
+  const ready = !isSettingUpStorage && !storageSetupError;
+  if (!ready && storageSetupError) {
+    reply.code(503);
+  }
+  return {
+    settingUp: isSettingUpStorage,
+    ready,
+    error: storageSetupError
+  };
+});
+
 // Global preHandler for setup mode
 fastify.addHook('preHandler', async (request, reply) => {
   if (isSettingUpStorage && !request.url.startsWith('/api/')) {
@@ -1404,9 +1431,13 @@ const start = async () => {
       isSettingUpStorage = true;
       try {
         await setupMinioForScheduler();
+        storageSetupError = null;
         console.log('MinIO storage setup completed');
       } catch (error) {
-        console.warn('MinIO setup failed during startup:', error.message);
+        // Surface loudly at error level and keep the failure visible via the
+        // /api/storage/status endpoint rather than swallowing it as a warning.
+        storageSetupError = error.message;
+        console.error('MinIO setup FAILED during startup — storage is not ready:', error);
       }
       isSettingUpStorage = false;
     }
