@@ -224,6 +224,13 @@ class OSCClient {
                 throw new Error('MinIO instance created but not ready yet');
             }
 
+            // The control plane returns the URL as soon as the instance record
+            // exists, which can be before the ingress route is actually serving.
+            // Poll the endpoint's health check until it answers so callers don't
+            // race the ingress (and hit its fake self-signed cert) when opening
+            // an S3 connection right afterwards.
+            await this.waitForMinioEndpointReady(instanceDetails.url);
+
             return {
                 instanceName,
                 endpoint: instanceDetails.url,
@@ -236,6 +243,34 @@ class OSCClient {
             console.error('Failed to create MinIO instance via OSC API:', error);
             throw error;
         }
+    }
+
+    // Poll the MinIO endpoint's own health check until it responds, so we don't
+    // return before the ingress route is actually live. Bounded retries — never
+    // loops forever. Mirrors the control-plane poll loop above in style.
+    async waitForMinioEndpointReady(endpoint, maxRetries = 30, delayMs = 2000) {
+        const healthUrl = `${endpoint.replace(/\/+$/, '')}/minio/health/live`;
+        let retries = 0;
+
+        while (retries < maxRetries) {
+            try {
+                const response = await fetch(healthUrl, { method: 'GET' });
+                if (response.ok) {
+                    console.log(`MinIO endpoint is live and serving: ${endpoint}`);
+                    return true;
+                }
+                console.log(`MinIO endpoint not serving yet (HTTP ${response.status}), waiting... (${retries + 1}/${maxRetries})`);
+            } catch (error) {
+                // Connection refused / TLS not ready / DNS not resolving yet while
+                // the ingress route comes up — keep polling until it settles.
+                console.log(`MinIO endpoint not reachable yet (${error.message}), waiting... (${retries + 1}/${maxRetries})`);
+            }
+
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+            retries++;
+        }
+
+        throw new Error(`MinIO endpoint did not become ready at ${healthUrl} after ${maxRetries} attempts`);
     }
 
     async getMinioInstance(instanceName) {
@@ -300,20 +335,50 @@ class OSCClient {
 
         const results = [];
 
-        for (const bucketName of bucketNames) {
-            try {
-                // Check if bucket already exists
-                let bucketExists = false;
+        // Distinguish "bucket is missing" from "the endpoint/ingress is flapping".
+        // A missing bucket means we should create it; a transient network/TLS/5xx
+        // error during startup should be retried, not treated as "not found".
+        const isTransientError = (error) => {
+            if (!error) return false;
+            const retriableCodes = ['NetworkingError', 'TimeoutError', 'RequestTimeout',
+                'InternalError', 'ServiceUnavailable', 'SlowDown', 'ECONNREFUSED',
+                'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN'];
+            const statusCode = error.statusCode || (error.originalError && error.originalError.statusCode);
+            if (statusCode && statusCode >= 500) return true;
+            if (error.code && retriableCodes.includes(error.code)) return true;
+            // Ingress default cert before the real route is live.
+            if (typeof error.message === 'string' && /self-signed certificate|self signed certificate/i.test(error.message)) return true;
+            return false;
+        };
+
+        // Ensure a single bucket exists, retrying transient route flaps during
+        // startup so one early failure isn't terminal. Bounded — never infinite.
+        const ensureBucket = async (bucketName, maxRetries = 10, delayMs = 3000) => {
+            let attempt = 0;
+            for (;;) {
                 try {
                     await s3.headBucket({ Bucket: bucketName }).promise();
-                    bucketExists = true;
                     console.log(`Bucket '${bucketName}' already exists`);
+                    return true; // existed
                 } catch (headError) {
-                    // Bucket doesn't exist, we'll create it
+                    if (isTransientError(headError) && attempt < maxRetries) {
+                        attempt++;
+                        console.warn(`headBucket('${bucketName}') hit a transient error (${headError.code || headError.message}), retrying... (${attempt}/${maxRetries})`);
+                        await new Promise(resolve => setTimeout(resolve, delayMs));
+                        continue;
+                    }
+                    // Not transient (or out of retries) — treat as "bucket missing" and create it.
                     console.log(`Creating bucket: ${bucketName}`);
                     await s3.createBucket({ Bucket: bucketName }).promise();
                     console.log(`Successfully created bucket: ${bucketName}`);
+                    return false; // created
                 }
+            }
+        };
+
+        for (const bucketName of bucketNames) {
+            try {
+                const bucketExists = await ensureBucket(bucketName);
                 
                 // If this is the output bucket and makeOutputPublic is true, set public read policy
                 if (bucketName === 'output' && makeOutputPublic) {
