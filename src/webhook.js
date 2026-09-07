@@ -1,6 +1,27 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
+// A defined "no content" result the Channel Engine can accept without erroring.
+// Returned for channels that have no scheduled clips so an empty channel does not
+// produce a 500 on every ~5s webhook poll.
+const EMPTY_VOD = Object.freeze({ id: null, title: null, hlsUrl: null, empty: true });
+
+// Throttle the "empty channel" log so it is emitted at most once per channel rather
+// than on every poll. Keyed by channelId; value is the last time we logged for it.
+const emptyChannelLoggedAt = new Map();
+const EMPTY_CHANNEL_LOG_INTERVAL_MS = 60 * 60 * 1000; // at most once per hour per channel
+
+function logEmptyChannelOnce(channelId) {
+  const last = emptyChannelLoggedAt.get(channelId);
+  const now = Date.now();
+  if (last === undefined || now - last >= EMPTY_CHANNEL_LOG_INTERVAL_MS) {
+    console.log(
+      `Channel ${channelId} has no scheduled clips - returning empty/no-content result (suppressing repeat logs)`
+    );
+    emptyChannelLoggedAt.set(channelId, now);
+  }
+}
+
 async function getNextVod(channelId) {
   try {
     const now = new Date();
@@ -30,11 +51,9 @@ async function getNextVod(channelId) {
       });
     }
 
-    // If still no item, we're looping back to the beginning
+    // If still no item, we're either looping back to the beginning or the channel
+    // is empty. Get the first item by position to tell the two cases apart.
     if (!schedule) {
-      console.log(`No upcoming schedule items found for channel ${channelId}, looping back to beginning and updating schedule times`);
-      
-      // Get the first item by position
       schedule = await prisma.schedule.findFirst({
         where: {
           channelId,
@@ -45,6 +64,9 @@ async function getNextVod(channelId) {
       });
 
       if (schedule) {
+        // A real loop-back: there are clips, we just ran past the last window.
+        console.log(`No upcoming schedule items found for channel ${channelId}, looping back to beginning and updating schedule times`);
+
         // Update the entire schedule to start from now
         const { rebalanceSchedule } = require('./schedulingUtils');
         
@@ -72,7 +94,12 @@ async function getNextVod(channelId) {
     }
 
     if (!schedule) {
-      throw new Error('No schedule found for channel');
+      // Every lookup (current window, next upcoming, loop-back by position) came up
+      // empty, so this channel genuinely has no active scheduled clips. Rather than
+      // throwing (which the route turns into a 500 on every poll), return a defined
+      // no-content result and log at most once per channel.
+      logEmptyChannelOnce(channelId);
+      return { ...EMPTY_VOD };
     }
 
     const response = {
