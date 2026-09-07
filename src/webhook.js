@@ -25,34 +25,37 @@ function logEmptyChannelOnce(channelId) {
 async function getNextVod(channelId) {
   try {
     const now = new Date();
-    
-    // Find the current or next scheduled item
-    let schedule = await prisma.schedule.findFirst({
-      where: {
-        channelId,
-        isActive: true,
-        scheduledStart: { lte: now },
-        scheduledEnd: { gte: now }
-      },
-      include: { vod: true },
-      orderBy: { scheduledStart: 'asc' }
-    });
 
-    // If no current item, get the next one
-    if (!schedule) {
+    // The Channel Engine polls this endpoint (~every 5s) to obtain the VOD to append
+    // NEXT in its VOD2Live loop. We therefore must advance through the schedule by
+    // position (1 -> 2 -> 3 -> loop) instead of repeatedly returning the clip whose
+    // window happens to span `now` (which re-queues clip 1 forever). We track the last
+    // position handed to the engine on the channel and hand out the one after it.
+    const channel = await prisma.channel.findUnique({ where: { id: channelId } });
+    if (!channel) {
+      throw new Error('No schedule found for channel');
+    }
+
+    const lastServedPosition = channel.lastServedPosition;
+
+    // Find the next active item after the last one we served.
+    let schedule = null;
+    if (lastServedPosition !== null && lastServedPosition !== undefined) {
       schedule = await prisma.schedule.findFirst({
         where: {
           channelId,
           isActive: true,
-          scheduledStart: { gt: now }
+          position: { gt: lastServedPosition }
         },
         include: { vod: true },
-        orderBy: { scheduledStart: 'asc' }
+        orderBy: { position: 'asc' }
       });
     }
 
-    // If still no item, we're either looping back to the beginning or the channel
-    // is empty. Get the first item by position to tell the two cases apart.
+    // No item after the last served position (or nothing served yet): either loop back
+    // to the first item by position, or the channel is empty. Get the first item by
+    // position to tell the two cases apart. When we wrap around, rebalance the schedule
+    // times so the reported windows stay contiguous from now.
     if (!schedule) {
       schedule = await prisma.schedule.findFirst({
         where: {
@@ -63,23 +66,23 @@ async function getNextVod(channelId) {
         orderBy: { position: 'asc' }
       });
 
-      if (schedule) {
-        // A real loop-back: there are clips, we just ran past the last window.
-        console.log(`No upcoming schedule items found for channel ${channelId}, looping back to beginning and updating schedule times`);
+      if (schedule && lastServedPosition !== null && lastServedPosition !== undefined) {
+        // Genuine loop-back (we had already served something and ran off the end).
+        // If nothing was served yet (lastServedPosition null), we simply start at the
+        // first item without rebalancing. An empty channel leaves `schedule` null and
+        // falls through to the graceful no-content return below.
+        console.log(`Reached end of schedule for channel ${channelId}, looping back to position ${schedule.position} at ${now}`);
 
-        // Update the entire schedule to start from now
         const { rebalanceSchedule } = require('./schedulingUtils');
-        
-        // Update the channel's schedule start to current time
+
+        // Update the channel's schedule start to current time and rebalance times.
         await prisma.channel.update({
           where: { id: channelId },
           data: { scheduleStart: now }
         });
-        
-        // Rebalance all schedule times starting from position 1
         await rebalanceSchedule(channelId, 1);
-        
-        // Fetch the updated schedule item
+
+        // Re-fetch the (now rebalanced) first item.
         schedule = await prisma.schedule.findFirst({
           where: {
             channelId,
@@ -88,8 +91,6 @@ async function getNextVod(channelId) {
           },
           include: { vod: true }
         });
-        
-        console.log(`Schedule updated for channel ${channelId} - restarted from position 1 at ${now}`);
       }
     }
 
@@ -101,6 +102,12 @@ async function getNextVod(channelId) {
       logEmptyChannelOnce(channelId);
       return { ...EMPTY_VOD };
     }
+
+    // Record the position we are handing to the engine so the next poll advances.
+    await prisma.channel.update({
+      where: { id: channelId },
+      data: { lastServedPosition: schedule.position }
+    });
 
     const response = {
       id: schedule.vod.id,
