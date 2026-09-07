@@ -59,7 +59,12 @@ if [ ! -f "${DATA_DIR}/prod.db" ]; then\n\
   HEALTH_PID=$!\n\
   \n\
   echo "Initializing database..."\n\
-  npx prisma db push\n\
+  if ! npx prisma db push; then\n\
+    echo "Database initialization failed"\n\
+    kill $HEALTH_PID 2>/dev/null || true\n\
+    wait $HEALTH_PID 2>/dev/null || true\n\
+    exit 1\n\
+  fi\n\
   \n\
   # Stop health server\n\
   echo "Database initialization complete, stopping health server..."\n\
