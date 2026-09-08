@@ -22,7 +22,12 @@ function logEmptyChannelOnce(channelId) {
   }
 }
 
-async function getNextVod(channelId) {
+// `advance` (default true) controls whether the returned position is persisted as the
+// channel's lastServedPosition. The engine webhook (/webhook/nextVod) must advance so
+// each ~5s poll queues the NEXT clip. Read-only callers such as the /current lookup pass
+// { advance: false } so peeking at "what's playing now" does not move the pointer and
+// cause the next engine poll to skip a clip.
+async function getNextVod(channelId, { advance = true } = {}) {
   try {
     const now = new Date();
 
@@ -104,10 +109,14 @@ async function getNextVod(channelId) {
     }
 
     // Record the position we are handing to the engine so the next poll advances.
-    await prisma.channel.update({
-      where: { id: channelId },
-      data: { lastServedPosition: schedule.position }
-    });
+    // Skip this for read-only callers (advance: false) so a "what's playing now"
+    // lookup does not move the pointer and make the next engine poll skip a clip.
+    if (advance) {
+      await prisma.channel.update({
+        where: { id: channelId },
+        data: { lastServedPosition: schedule.position }
+      });
+    }
 
     const response = {
       id: schedule.vod.id,
