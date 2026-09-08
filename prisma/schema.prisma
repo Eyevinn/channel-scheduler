@@ -20,6 +20,7 @@ model Channel {
   lastStatusCheck       DateTime?  @map("last_status_check")
   lastWebhookCall       DateTime?  @map("last_webhook_call")
   scheduleSynced        Boolean    @default(false) @map("schedule_synced")
+  lastServedPosition    Int?       @map("last_served_position")
   createdAt             DateTime   @default(now()) @map("created_at")
   updatedAt             DateTime   @updatedAt @map("updated_at")
   schedules             Schedule[]

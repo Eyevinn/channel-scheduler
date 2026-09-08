@@ -847,7 +847,9 @@ fastify.get('/api/channels/:channelId/schedule', async (request, reply) => {
 fastify.get('/api/channels/:channelId/current', async (request, reply) => {
   try {
     const { getNextVod } = require('./webhook');
-    const currentVod = await getNextVod(request.params.channelId);
+    // Read-only "what's playing now" lookup: do NOT advance the rotation pointer,
+    // otherwise the next engine webhook poll would skip a clip.
+    const currentVod = await getNextVod(request.params.channelId, { advance: false });
     return currentVod;
   } catch (error) {
     console.error('Error getting current item:', error);
