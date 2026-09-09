@@ -552,10 +552,45 @@ class OSCClient {
                 status = 'pending';
             }
 
+            // Surface the underlying ffmpeg process exit code and stderr so a failed
+            // transcode is diagnosable. The exact field names ffmpeg-s3 exposes on the
+            // OSC instance object are not confirmed from this repo, so read defensively
+            // across plausible shapes (best-effort until confirmed against a live job,
+            // tracked in issue #28). A running/pending job has no exit code yet, so
+            // these are simply undefined/null in that case (do not throw).
+            const firstPresent = (obj, keys) => {
+                if (!obj || typeof obj !== 'object') return undefined;
+                for (const key of keys) {
+                    if (obj[key] !== undefined && obj[key] !== null) {
+                        return obj[key];
+                    }
+                }
+                return undefined;
+            };
+
+            const exitCode = firstPresent(jobDetails, [
+                'exitCode', 'exit_code', 'code', 'returnCode', 'return_code'
+            ]);
+            const stderr = firstPresent(jobDetails, [
+                'stderr', 'errorOutput', 'error_output', 'logs', 'error', 'message'
+            ]);
+
+            if (status === 'failed') {
+                console.error(
+                    `Transcoding job '${jobName}' failed (oscStatus=${jobDetails.status}) ` +
+                    `exitCode=${exitCode === undefined ? 'n/a' : exitCode}`
+                );
+                if (stderr !== undefined) {
+                    console.error(`Transcoding job '${jobName}' stderr: ${stderr}`);
+                }
+            }
+
             return {
                 jobId: jobName,
                 status: status,
                 oscStatus: jobDetails.status,
+                exitCode: exitCode,
+                stderr: stderr,
                 details: jobDetails
             };
         } catch (error) {

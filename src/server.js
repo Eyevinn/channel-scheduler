@@ -802,7 +802,9 @@ fastify.get('/api/transcode-status/:jobId', async (request, reply) => {
     return {
       jobId: jobStatus.jobId,
       status: jobStatus.status,
-      oscStatus: jobStatus.oscStatus
+      oscStatus: jobStatus.oscStatus,
+      exitCode: jobStatus.exitCode,
+      stderr: jobStatus.stderr
     };
 
   } catch (error) {
