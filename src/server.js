@@ -15,7 +15,7 @@ const fastify = require('fastify')({
 const { PrismaClient } = require('@prisma/client');
 const path = require('path');
 const { registerWebhookRoutes } = require('./webhook');
-const { getHLSDuration, validateHLSUrl } = require('./hlsUtils');
+const { getHLSDuration, validateHLSUrl, DURATION_SOURCE } = require('./hlsUtils');
 const { calculateBackToBackSchedule, rebalanceSchedule, updateChannelScheduleStart } = require('./schedulingUtils');
 const { seedDatabase } = require('./seedData');
 const { OSCClient } = require('./oscClient');
@@ -317,14 +317,28 @@ fastify.get('/api/vods', async (request, reply) => {
 fastify.post('/api/vods', async (request, reply) => {
   try {
     const { title, description, hlsUrl, durationMs, prerollUrl, prerollDurationMs, metadata } = request.body;
-    
+
     // Auto-detect duration if not provided
     let finalDurationMs = durationMs;
     if (!finalDurationMs && hlsUrl) {
       console.log(`Auto-detecting duration for VOD: ${title}`);
-      finalDurationMs = await getHLSDuration(hlsUrl);
+      try {
+        const detection = await getHLSDuration(hlsUrl);
+        finalDurationMs = detection.durationMs;
+        if (detection.source === DURATION_SOURCE.ESTIMATED) {
+          console.warn(`Duration for "${title}" is an estimate, not a measurement: ${finalDurationMs}ms`);
+        }
+      } catch (detectError) {
+        // Duration is unknown: do NOT persist an asset with a placeholder
+        // duration - surface it as broken so it is not scheduled.
+        console.error(`Duration detection failed for "${title}" (${hlsUrl}):`, detectError.message);
+        return reply.code(422).send({
+          error: 'Could not determine VOD duration from HLS manifest',
+          details: detectError.message
+        });
+      }
     }
-    
+
     const vod = await prisma.vOD.create({
       data: {
         title,
@@ -981,8 +995,25 @@ fastify.post('/api/vods/detect-duration', async (request, reply) => {
       return reply.code(400).send({ error: 'hlsUrl is required' });
     }
     
-    const durationMs = await getHLSDuration(hlsUrl);
-    return { durationMs, durationSeconds: Math.round(durationMs / 1000) };
+    let detection;
+    try {
+      detection = await getHLSDuration(hlsUrl);
+    } catch (detectError) {
+      // Hard failure: the manifest is unreachable/unparseable. Report it as
+      // an unknown duration rather than a fabricated value.
+      console.error(`Duration detection failed for ${hlsUrl}:`, detectError.message);
+      return reply.code(422).send({
+        error: 'Could not determine duration from HLS manifest',
+        details: detectError.message
+      });
+    }
+
+    return {
+      durationMs: detection.durationMs,
+      durationSeconds: Math.round(detection.durationMs / 1000),
+      source: detection.source,
+      estimated: detection.source === DURATION_SOURCE.ESTIMATED
+    };
   } catch (error) {
     reply.code(500).send({ error: 'Failed to detect duration' });
   }
