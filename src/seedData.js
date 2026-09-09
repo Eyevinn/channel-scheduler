@@ -49,9 +49,10 @@ async function seedDatabase() {
             
             try {
                 // Auto-detect duration from HLS manifest
-                const durationMs = await getHLSDuration(vodData.hlsUrl);
-                console.log(`Detected duration: ${Math.round(durationMs / 1000)}s`);
-                
+                const detection = await getHLSDuration(vodData.hlsUrl);
+                const durationMs = detection.durationMs;
+                console.log(`Detected duration: ${Math.round(durationMs / 1000)}s (${detection.source})`);
+
                 await prisma.vOD.create({
                     data: {
                         title: vodData.title,
@@ -60,20 +61,13 @@ async function seedDatabase() {
                         durationMs: durationMs
                     }
                 });
-                
+
                 console.log(`✓ Added: ${vodData.title}`);
             } catch (error) {
+                // Detection failed: skip seeding this asset entirely rather than
+                // persisting a placeholder duration for a dead manifest.
                 console.error(`Failed to process ${vodData.title}:`, error.message);
-                // Create without duration if detection fails
-                await prisma.vOD.create({
-                    data: {
-                        title: vodData.title,
-                        description: vodData.description,
-                        hlsUrl: vodData.hlsUrl,
-                        durationMs: 30000 // Default 30 seconds
-                    }
-                });
-                console.log(`✓ Added: ${vodData.title} (with default duration)`);
+                console.warn(`✗ Skipped: ${vodData.title} (duration could not be determined)`);
             }
         }
         
