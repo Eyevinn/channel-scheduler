@@ -811,14 +811,21 @@ fastify.get('/api/transcode-status/:jobId', async (request, reply) => {
       return reply.code(400).send({ error: 'OSC not configured' });
     }
 
-    const jobStatus = await oscClient.getTranscodingJobStatus(jobId);
-    
+    // The expected HLS master manifest URL is needed so a terminated ("Complete")
+    // job can be confirmed to have actually written playable output before we
+    // report it as completed (issue #24). The client passes the hlsUrl it was
+    // given when the job was created.
+    const masterManifestUrl = request.query.hlsUrl;
+
+    const jobStatus = await oscClient.getTranscodingJobStatus(jobId, { masterManifestUrl });
+
     return {
       jobId: jobStatus.jobId,
       status: jobStatus.status,
       oscStatus: jobStatus.oscStatus,
       exitCode: jobStatus.exitCode,
-      stderr: jobStatus.stderr
+      stderr: jobStatus.stderr,
+      failureReason: jobStatus.failureReason
     };
 
   } catch (error) {

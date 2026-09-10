@@ -1,6 +1,7 @@
 require('dotenv').config();
 const { Context, createInstance, listInstances, removeInstance, getInstance } = require('@osaas/client-core');
 const { createMinioMinioInstance, getMinioMinioInstance, removeMinioMinioInstance } = require('@osaas/client-services');
+const { validateHLSUrl } = require('./hlsUtils');
 
 // Try to import FFmpeg S3 functions (may not exist in current version)
 let createTranscodeEyevinnFfmpegS3Instance, getTranscodeEyevinnFfmpegS3Instance, removeTranscodeEyevinnFfmpegS3Instance;
@@ -518,14 +519,35 @@ class OSCClient {
         }
     }
 
-    async getTranscodingJobStatus(jobName) {
+    // Verify a terminated transcode actually produced a playable HLS master
+    // manifest at the expected output URL. The output bucket is created with a
+    // public-read policy (see createMinioBuckets), so a plain HTTP HEAD/GET via
+    // validateHLSUrl can confirm the manifest resolves. Returns true only when
+    // the manifest is fetchable and looks like an HLS playlist; false on any
+    // failure. Never throws — a check failure means "not verified", i.e. failed.
+    async isMasterManifestFetchable(masterManifestUrl) {
+        if (!masterManifestUrl) return false;
+        try {
+            return await validateHLSUrl(masterManifestUrl);
+        } catch (error) {
+            console.error(`Failed to fetch master manifest ${masterManifestUrl}: ${error.message}`);
+            return false;
+        }
+    }
+
+    // options.masterManifestUrl - expected HLS master manifest URL for this job's
+    //   output. When provided, a terminated ("Complete") job is only reported as
+    //   completed if that manifest is actually fetchable.
+    async getTranscodingJobStatus(jobName, options = {}) {
         if (!this.isConfigured()) {
             throw new Error('OSC_ACCESS_TOKEN environment variable is not configured');
         }
 
+        const { masterManifestUrl } = options;
+
         try {
             let jobDetails;
-            
+
             if (getTranscodeEyevinnFfmpegS3Instance) {
                 jobDetails = await getTranscodeEyevinnFfmpegS3Instance(this.context, jobName);
             } else {
@@ -536,20 +558,6 @@ class OSCClient {
 
             if (!jobDetails) {
                 throw new Error(`Transcoding job '${jobName}' not found`);
-            }
-
-            // Map OSC status to our status
-            let status = 'unknown';
-            if (jobDetails.status === 'Running') {
-                status = 'processing';
-            } else if (jobDetails.status === 'Complete' || jobDetails.status === 'SuccessCriteriaMet') {
-                status = 'completed';
-            } else if (jobDetails.status === 'Failed' || jobDetails.status === 'Error' || jobDetails.status === 'FailureTarget') {
-                status = 'failed';
-            } else if (jobDetails.status === 'Suspended') {
-                status = 'suspended';
-            } else {
-                status = 'pending';
             }
 
             // Surface the underlying ffmpeg process exit code and stderr so a failed
@@ -575,10 +583,51 @@ class OSCClient {
                 'stderr', 'errorOutput', 'error_output', 'logs', 'error', 'message'
             ]);
 
+            // Map OSC status to our status.
+            let status = 'unknown';
+            let failureReason;
+            if (jobDetails.status === 'Running') {
+                status = 'processing';
+            } else if (jobDetails.status === 'Complete' || jobDetails.status === 'SuccessCriteriaMet') {
+                // OSC "Complete" only means the container terminated, NOT that
+                // ffmpeg succeeded. A non-zero exit still terminates, so we must
+                // confirm the outcome before calling it completed (issue #24).
+                // Prefer the ffmpeg exit code when the instance exposes it; a
+                // non-zero exit is an unambiguous failure. Independently, verify
+                // the expected HLS master manifest actually landed and is
+                // fetchable, so a clean exit that wrote no output is still caught.
+                const exitCodeNum = exitCode === undefined ? undefined : Number(exitCode);
+                if (exitCodeNum !== undefined && !Number.isNaN(exitCodeNum) && exitCodeNum !== 0) {
+                    status = 'failed';
+                    failureReason = `ffmpeg exited with code ${exitCodeNum}`;
+                } else {
+                    // Exit code is zero or unavailable: fall back to proving the
+                    // output exists. If no manifest URL was supplied we cannot
+                    // verify, and a job we cannot verify must NOT be reported as
+                    // completed (that is exactly the false-positive from #24).
+                    const manifestOk = await this.isMasterManifestFetchable(masterManifestUrl);
+                    if (manifestOk) {
+                        status = 'completed';
+                    } else {
+                        status = 'failed';
+                        failureReason = masterManifestUrl
+                            ? `output master manifest not fetchable at ${masterManifestUrl}`
+                            : 'output master manifest could not be verified (no manifest URL provided)';
+                    }
+                }
+            } else if (jobDetails.status === 'Failed' || jobDetails.status === 'Error' || jobDetails.status === 'FailureTarget') {
+                status = 'failed';
+            } else if (jobDetails.status === 'Suspended') {
+                status = 'suspended';
+            } else {
+                status = 'pending';
+            }
+
             if (status === 'failed') {
                 console.error(
                     `Transcoding job '${jobName}' failed (oscStatus=${jobDetails.status}) ` +
-                    `exitCode=${exitCode === undefined ? 'n/a' : exitCode}`
+                    `exitCode=${exitCode === undefined ? 'n/a' : exitCode}` +
+                    (failureReason ? ` reason=${failureReason}` : '')
                 );
                 if (stderr !== undefined) {
                     console.error(`Transcoding job '${jobName}' stderr: ${stderr}`);
@@ -591,6 +640,7 @@ class OSCClient {
                 oscStatus: jobDetails.status,
                 exitCode: exitCode,
                 stderr: stderr,
+                failureReason: failureReason,
                 details: jobDetails
             };
         } catch (error) {
