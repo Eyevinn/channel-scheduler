@@ -435,8 +435,10 @@ class OSCClient {
         try {
             console.log(`Creating transcoding job: ${jobName}`);
 
-            // FFmpeg command to transcode to truly demuxed HLS (separate audio/video streams)
-            const cmdLineArgs = [
+            // FFmpeg command to transcode to truly demuxed HLS (separate audio/video streams).
+            // Kept as an array first so we can log the pre-join argument list alongside the
+            // final joined string (see the diagnostics block after this definition).
+            const cmdLineArgsList = [
                 `-i s3://input/${inputS3Path}`,
                 
                 // Video stream settings
@@ -466,7 +468,34 @@ class OSCClient {
                 '-master_pl_name master.m3u8',
                 `-hls_segment_filename s3://output/${outputS3Path}/stream_%v/segment_%03d.ts`,
                 `s3://output/${outputS3Path}/stream_%v/playlist.m3u8`
-            ].join(' ');
+            ];
+            const cmdLineArgs = cmdLineArgsList.join(' ');
+
+            // Diagnostics for issue #28 (FFmpeg exit 234 with no HLS output on the
+            // scheduler's own transcode invocation). Log the EXACT cmdLineArgs we submit
+            // — both the pre-join array (one element per line so element boundaries are
+            // unambiguous) and the final joined string handed to the ffmpeg-s3 service —
+            // so a live run can be compared byte-for-byte against what the encoder
+            // container actually received. The leading hypothesis is that the embedded
+            // double quotes + space in the -var_stream_map element get mangled when the
+            // platform turns this cmdLineArgs config string into the container's argv, so
+            // that element is called out explicitly below.
+            //
+            // NOTE: This repo has NO way to retrieve the encoder container's real argv or
+            // stderr other than whatever fields the ffmpeg-s3 instance object happens to
+            // expose (read defensively in getTranscodingJobStatus). The encoder-side argv
+            // must therefore be captured from the live run's container logs and compared
+            // against the value logged here — it cannot be produced from this repo alone.
+            console.log(`[transcode #28] cmdLineArgs array (${cmdLineArgsList.length} elements) for job '${jobName}':`);
+            cmdLineArgsList.forEach((arg, index) => {
+                console.log(`[transcode #28]   [${index}] ${arg}`);
+            });
+            console.log(`[transcode #28] cmdLineArgs joined string for job '${jobName}': ${cmdLineArgs}`);
+            const varStreamMapArg = cmdLineArgsList.find((arg) => arg.startsWith('-var_stream_map'));
+            console.log(
+                `[transcode #28] -var_stream_map element (quoting-hypothesis lead) for job '${jobName}': ` +
+                `${varStreamMapArg === undefined ? 'NOT PRESENT' : varStreamMapArg}`
+            );
 
             // Try using the dedicated FFmpeg S3 service if available
             if (createTranscodeEyevinnFfmpegS3Instance) {
