@@ -1518,7 +1518,12 @@ class ChannelScheduler {
         }
 
         try {
-            const response = await fetch(`/api/transcode-status/${this.currentTranscodingJob.jobId}`);
+            // Pass the expected HLS URL so the server can confirm the transcode
+            // actually wrote a fetchable master manifest before reporting it
+            // completed (issue #24).
+            const statusUrl = `/api/transcode-status/${this.currentTranscodingJob.jobId}`
+                + `?hlsUrl=${encodeURIComponent(this.currentTranscodingJob.hlsUrl || '')}`;
+            const response = await fetch(statusUrl);
             
             if (!response.ok) {
                 throw new Error('Failed to check transcoding status');
@@ -1551,9 +1556,13 @@ class ChannelScheduler {
                 this.currentTranscodingJob = null;
                 
             } else if (result.status === 'failed') {
+                const reason = result.failureReason
+                    || (result.exitCode !== undefined && result.exitCode !== null
+                        ? `ffmpeg exit code ${result.exitCode}`
+                        : null);
                 uploadSuccess.innerHTML = `
                     <i class="fas fa-times-circle mr-1 text-red-500"></i>
-                    <span class="text-red-600">Transcoding failed</span>
+                    <span class="text-red-600">Transcoding failed${reason ? `: ${reason}` : ''}</span>
                 `;
                 
                 // Re-enable save button on failure (user can still save with original file)
