@@ -295,6 +295,31 @@ When OSC integration is enabled, the system automatically:
 - `POST /api/setup-minio` - Create MinIO instance with input/output buckets
 - `GET /api/minio-config` - Get MinIO instance configuration
 
+### Status API
+
+- `GET /api/osc-status` - OSC configuration status and build identification. In
+  addition to `configured` and `features`, the response includes a `build`
+  object identifying the running build:
+
+  ```json
+  {
+    "configured": true,
+    "features": { "upload": true, "transcode": true, "channelEngines": true },
+    "build": { "commit": "a1b2c3d", "version": "1.0.0" }
+  }
+  ```
+
+  `commit` is baked into the container image at build time from the
+  `SOURCE_COMMIT` build arg (falls back to `git rev-parse` when run from a
+  checkout, otherwise `"unknown"`); `version` comes from `package.json`. Build
+  the image with the sha via:
+
+  ```bash
+  docker build --build-arg SOURCE_COMMIT="$(git rev-parse --short HEAD)" -t channel-scheduler .
+  ```
+
+- `GET /api/storage/status` - Storage (MinIO) setup readiness
+
 ## Development
 
 ### Database Management

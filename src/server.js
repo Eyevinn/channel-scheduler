@@ -19,6 +19,7 @@ const { getHLSDuration, validateHLSUrl, DURATION_SOURCE } = require('./hlsUtils'
 const { calculateBackToBackSchedule, rebalanceSchedule, updateChannelScheduleStart } = require('./schedulingUtils');
 const { seedDatabase } = require('./seedData');
 const { OSCClient } = require('./oscClient');
+const { getBuildInfo } = require('./buildInfo');
 
 // Utility function to sanitize filenames for upload
 function sanitizeFilename(filename) {
@@ -1438,7 +1439,10 @@ fastify.get('/api/osc-status', async (request, reply) => {
         upload: oscClient.isConfigured(),
         transcode: oscClient.isConfigured(),
         channelEngines: oscClient.isConfigured()
-      }
+      },
+      // Identify which build this running instance is (issue #41). The commit is
+      // baked in at image build time; version comes from package.json.
+      build: getBuildInfo()
     };
   } catch (error) {
     reply.code(500).send({ error: 'Failed to check OSC status' });

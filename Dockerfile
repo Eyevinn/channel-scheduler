@@ -77,4 +77,11 @@ exec npm start' > /app/start.sh
 
 RUN chmod +x /app/start.sh
 
+# Bake the build's commit sha into the image so a running container can report
+# which build it is (issue #41). Kept late in the build to avoid busting the
+# layer cache above when only the sha changes. Pass at build time with e.g.
+#   docker build --build-arg SOURCE_COMMIT="$(git rev-parse --short HEAD)" .
+ARG SOURCE_COMMIT="unknown"
+ENV SOURCE_COMMIT=${SOURCE_COMMIT}
+
 CMD ["/app/start.sh"]
