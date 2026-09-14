@@ -39,6 +39,28 @@ class OSCClient {
         return password;
     }
 
+    // Return a shallow copy of an OSC instance/config object with any generated
+    // credential fields masked, so objects can be logged without leaking secrets
+    // (e.g. the MinIO RootPassword) into the startup logs. Matches on common
+    // credential key names case-insensitively. Non-object input is returned as-is.
+    redactSecrets(obj) {
+        if (!obj || typeof obj !== 'object') {
+            return obj;
+        }
+        const SECRET_KEY_PATTERN = /(password|rootpass|secretaccesskey|secretkey|secret_key|accesskey|access_key|accesstoken|access_token|apikey|api_key|token)/i;
+        const redacted = Array.isArray(obj) ? [] : {};
+        for (const [key, value] of Object.entries(obj)) {
+            if (SECRET_KEY_PATTERN.test(key)) {
+                redacted[key] = '[REDACTED]';
+            } else if (value && typeof value === 'object') {
+                redacted[key] = this.redactSecrets(value);
+            } else {
+                redacted[key] = value;
+            }
+        }
+        return redacted;
+    }
+
 
     async createChannelEngineInstance(instanceName, webhookUrl) {
         if (!this.isConfigured()) {
@@ -64,7 +86,7 @@ class OSCClient {
                 }
             );
 
-            console.log(`Channel Engine instance created successfully:`, instance);
+            console.log(`Channel Engine instance created successfully:`, this.redactSecrets(instance));
 
             // Use the URL from the response or construct fallback
             const channelEngineUrl = instance.url || `https://${instanceName}.ce.prod.osaas.io/channels/${instanceName}/master.m3u8`;
@@ -194,7 +216,7 @@ class OSCClient {
                 RootPassword: rootPassword
             });
 
-            console.log(`MinIO instance created successfully:`, instance);
+            console.log(`MinIO instance created successfully:`, this.redactSecrets(instance));
 
             // Wait for instance to be ready and get credentials
             let retries = 0;
@@ -508,7 +530,7 @@ class OSCClient {
                     awsRegion: minioConfig.region || 'us-east-1'
                 });
 
-                console.log(`Transcoding job created successfully:`, instance);
+                console.log(`Transcoding job created successfully:`, this.redactSecrets(instance));
                 return {
                     jobId: instance.name,
                     status: 'pending',
@@ -533,7 +555,7 @@ class OSCClient {
                     }
                 );
 
-                console.log(`Transcoding job created successfully (fallback):`, instance);
+                console.log(`Transcoding job created successfully (fallback):`, this.redactSecrets(instance));
                 return {
                     jobId: instance.name,
                     status: 'pending', 
