@@ -614,6 +614,23 @@ fastify.post('/api/upload-file', async (request, reply) => {
       return reply.code(400).send({ error: 'MinIO not configured. OSC_ACCESS_TOKEN required.' });
     }
 
+    // Pre-flight storage-readiness guard: reject the upload early with a clear
+    // 503 when storage isn't actually ready (setup still running, or a prior
+    // setup failed — e.g. bucket creation errored). Reuses the same state the
+    // /api/storage/status endpoint reports, so we don't accept the upload and
+    // then 500/502 when the backend returns a non-XML (proxy/HTML) error body.
+    if (isSettingUpStorage) {
+      return reply.code(503).send({
+        error: 'Storage is not ready yet: setup is still in progress. Please try again shortly.'
+      });
+    }
+    if (storageSetupError) {
+      return reply.code(503).send({
+        error: 'Storage is not ready: storage setup failed. Uploads are unavailable until storage is set up successfully.',
+        details: storageSetupError
+      });
+    }
+
     // Get the uploaded file
     const data = await request.file();
     
@@ -747,6 +764,34 @@ fastify.post('/api/upload-file', async (request, reply) => {
 
   } catch (error) {
     console.error('File upload failed:', error);
+
+    // Defensive translation of non-S3-shaped backend errors. When storage is
+    // not actually ready, a proxy/gateway can return an HTML/plain 502 body
+    // that the S3 (aws-sdk v2) XML parser chokes on, throwing an
+    // "XMLParserError: Unexpected close tag" instead of a well-formed S3 error.
+    // Surface a meaningful message (and a 502/503) rather than an opaque 500.
+    const code = error && error.code ? String(error.code) : '';
+    const message = error && error.message ? String(error.message) : '';
+    const looksLikeParserError =
+      /XMLParser|Unexpected close tag|Non-whitespace before first tag|Unexpected end/i.test(code + ' ' + message);
+
+    if (looksLikeParserError) {
+      return reply.code(502).send({
+        error: 'Storage backend returned an unexpected (non-XML) response; it may not be ready or is unreachable. Please verify storage is set up and try again.'
+      });
+    }
+
+    // Well-formed S3/HTTP errors carry a statusCode — forward it (falling back
+    // to 502 for 5xx-class backend failures) so the client gets an accurate,
+    // non-opaque status instead of a blanket 500.
+    const backendStatus = error && (error.statusCode || (error.originalError && error.originalError.statusCode));
+    if (backendStatus && backendStatus >= 400) {
+      const status = backendStatus >= 500 ? 502 : backendStatus;
+      return reply.code(status).send({
+        error: 'Failed to upload file: storage backend error' + (code ? ` (${code})` : '') + '.'
+      });
+    }
+
     reply.code(500).send({ error: 'Failed to upload file' });
   }
 });
