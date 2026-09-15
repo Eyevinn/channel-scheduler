@@ -61,6 +61,17 @@ class OSCClient {
         return redacted;
     }
 
+    // Secret-typed instance fields (e.g. RootPassword) are NOT returned verbatim by
+    // the OSC control plane on read-back: they come back as a templated placeholder
+    // prefixed with "{{secrets}}" (see the SDK's own instanceValue()/valueOrSecret()
+    // masking in @osaas/client-core). That placeholder is not a usable credential —
+    // handing it to the S3 client as the secretAccessKey yields SignatureDoesNotMatch,
+    // surfaced as HTTP 401 (issue #42). Use this to detect the placeholder so callers
+    // never treat it as a real password.
+    isSecretPlaceholder(value) {
+        return typeof value === 'string' && /^\{\{secrets\}\}/.test(value);
+    }
+
 
     async createChannelEngineInstance(instanceName, webhookUrl) {
         if (!this.isConfigured()) {
@@ -254,11 +265,24 @@ class OSCClient {
             // an S3 connection right afterwards.
             await this.waitForMinioEndpointReady(instanceDetails.url);
 
+            // Credential source of truth for the create path: the RootUser/RootPassword
+            // we just supplied on the POST. The read-back (getMinioMinioInstance) returns
+            // RootPassword as a masked "{{secrets}}" placeholder, not the real value, so
+            // using it as the S3 secretAccessKey caused HTTP 401 on bucket creation
+            // (issue #42). Fall back to the locally-known values whenever the read-back
+            // value is missing or is a secret placeholder.
+            const rootUser = this.isSecretPlaceholder(instanceDetails.RootUser) || !instanceDetails.RootUser
+                ? username
+                : instanceDetails.RootUser;
+            const resolvedRootPassword = this.isSecretPlaceholder(instanceDetails.RootPassword) || !instanceDetails.RootPassword
+                ? rootPassword
+                : instanceDetails.RootPassword;
+
             return {
                 instanceName,
                 endpoint: instanceDetails.url,
-                rootUser: instanceDetails.RootUser,
-                rootPassword: instanceDetails.RootPassword,
+                rootUser,
+                rootPassword: resolvedRootPassword,
                 region: instanceDetails.region || 'us-east-1',
                 oscResponse: instanceDetails
             };
@@ -307,6 +331,21 @@ class OSCClient {
             // Handle case where instance exists but is not running
             if (!instance) {
                 throw new Error(`MinIO instance '${instanceName}' not found or not accessible`);
+            }
+
+            // The OSC read-back masks secret-typed fields as "{{secrets}}" placeholders
+            // (issue #42). We cannot recover the real RootPassword for an instance we did
+            // not just create — reading it back yields a placeholder that later fails as a
+            // confusing HTTP 401 on the S3 client. Warn loudly so this is diagnosable; the
+            // real fix for the fresh-provision case lives in createMinioInstance, which
+            // returns the password it supplied at creation time.
+            if (this.isSecretPlaceholder(instance.RootPassword)) {
+                console.warn(
+                    `MinIO instance '${instanceName}' returned a masked RootPassword placeholder ` +
+                    `('${instance.RootPassword}') from the control plane rather than a usable ` +
+                    `credential. Any S3 operation using it will fail with HTTP 401. The real root ` +
+                    `password is only available at creation time (issue #42).`
+                );
             }
 
             return {
